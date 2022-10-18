@@ -39,9 +39,11 @@ mod client;
 /// HTTP transport.
 pub mod transport;
 
+mod middleware;
 #[cfg(test)]
 mod tests;
 
 pub use client::{HttpClient, HttpClientBuilder};
 pub use hyper::http::{HeaderMap, HeaderValue};
 pub use jsonrpsee_types as types;
+pub use middleware::Middleware;

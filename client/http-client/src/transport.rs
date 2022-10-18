@@ -6,6 +6,7 @@
 // that we need to be guaranteed that hyper doesn't re-use an existing connection if we ever reset
 // the JSON-RPC request id to a value that might have already been used.
 
+use crate::Middleware;
 use hyper::client::{Client, HttpConnector};
 use hyper::http::{HeaderMap, HeaderValue};
 use hyper::Uri;
@@ -13,6 +14,8 @@ use jsonrpsee_core::client::CertificateStore;
 use jsonrpsee_core::error::GenericTransportError;
 use jsonrpsee_core::http_helpers;
 use jsonrpsee_core::tracing::{rx_log_from_bytes, tx_log_from_str};
+use std::fmt;
+use std::sync::Arc;
 use thiserror::Error;
 
 const CONTENT_TYPE_JSON: &str = "application/json";
@@ -37,7 +40,7 @@ impl HyperClient {
 }
 
 /// HTTP Transport Client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpTransportClient {
 	/// Target to connect to.
 	target: Uri,
@@ -51,6 +54,21 @@ pub struct HttpTransportClient {
 	max_log_length: u32,
 	/// Custom headers to pass with every request.
 	headers: HeaderMap,
+	/// Middleware to use for request
+	middleware_stack: Box<[Arc<dyn Middleware>]>,
+}
+
+impl fmt::Debug for HttpTransportClient {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		// skipping middleware_stack field for now
+		f.debug_struct("HttpTransportClient")
+			.field("target", &self.target)
+			.field("client", &self.client)
+			.field("max_request_body_size", &self.max_request_body_size)
+			.field("max_log_length", &self.max_log_length)
+			.field("headers", &self.headers)
+			.finish_non_exhaustive()
+	}
 }
 
 impl HttpTransportClient {
@@ -61,6 +79,7 @@ impl HttpTransportClient {
 		cert_store: CertificateStore,
 		max_log_length: u32,
 		headers: HeaderMap,
+		middleware_stack: Box<[Arc<dyn Middleware>]>,
 	) -> Result<Self, Error> {
 		let target: Uri = target.as_ref().parse().map_err(|e| Error::Url(format!("Invalid URL: {}", e)))?;
 		if target.port_u16().is_none() {
@@ -107,7 +126,7 @@ impl HttpTransportClient {
 			}
 		}
 
-		Ok(Self { target, client, max_request_body_size, max_log_length, headers: cached_headers })
+		Ok(Self { target, client, max_request_body_size, max_log_length, headers: cached_headers, middleware_stack })
 	}
 
 	async fn inner_send(&self, body: String) -> Result<hyper::Response<hyper::Body>, Error> {
@@ -120,6 +139,9 @@ impl HttpTransportClient {
 		let mut req = hyper::Request::post(&self.target);
 		if let Some(headers) = req.headers_mut() {
 			*headers = self.headers.clone();
+			for middleware in self.middleware_stack.iter() {
+				middleware.handle(headers).await;
+			}
 		}
 		let req = req.body(From::from(body)).expect("URI and request headers are valid; qed");
 
@@ -215,37 +237,69 @@ mod tests {
 
 	#[test]
 	fn invalid_http_url_rejected() {
-		let err = HttpTransportClient::new("ws://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
-			.unwrap_err();
+		let err = HttpTransportClient::new(
+			"ws://localhost:9933",
+			80,
+			CertificateStore::Native,
+			80,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
 
 	#[cfg(feature = "tls")]
 	#[test]
 	fn https_works() {
-		let client =
-			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
-				.unwrap();
+		let client = HttpTransportClient::new(
+			"https://localhost:9933",
+			80,
+			CertificateStore::Native,
+			80,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap();
 		assert_target(&client, "localhost", "https", "/", 9933, 80);
 	}
 
 	#[cfg(not(feature = "tls"))]
 	#[test]
 	fn https_fails_without_tls_feature() {
-		let err =
-			HttpTransportClient::new("https://localhost:9933", 80, CertificateStore::Native, 80, HeaderMap::new())
-				.unwrap_err();
+		let err = HttpTransportClient::new(
+			"https://localhost:9933",
+			80,
+			CertificateStore::Native,
+			80,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
 
 	#[test]
 	fn faulty_port() {
-		let err = HttpTransportClient::new("http://localhost:-43", 80, CertificateStore::Native, 80, HeaderMap::new())
-			.unwrap_err();
+		let err = HttpTransportClient::new(
+			"http://localhost:-43",
+			80,
+			CertificateStore::Native,
+			80,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
-		let err =
-			HttpTransportClient::new("http://localhost:-99999", 80, CertificateStore::Native, 80, HeaderMap::new())
-				.unwrap_err();
+		let err = HttpTransportClient::new(
+			"http://localhost:-99999",
+			80,
+			CertificateStore::Native,
+			80,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
 	}
 
@@ -257,6 +311,7 @@ mod tests {
 			CertificateStore::Native,
 			80,
 			HeaderMap::new(),
+			Box::new([]),
 		)
 		.unwrap();
 		assert_target(&client, "localhost", "http", "/my-special-path", 9944, 1337);
@@ -270,6 +325,7 @@ mod tests {
 			CertificateStore::WebPki,
 			80,
 			HeaderMap::new(),
+			Box::new([]),
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my?name1=value1&name2=value2", 9999, u32::MAX);
@@ -283,6 +339,7 @@ mod tests {
 			CertificateStore::Native,
 			80,
 			HeaderMap::new(),
+			Box::new([]),
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my.htm", 9944, 999);
@@ -291,9 +348,15 @@ mod tests {
 	#[tokio::test]
 	async fn request_limit_works() {
 		let eighty_bytes_limit = 80;
-		let client =
-			HttpTransportClient::new("http://localhost:9933", 80, CertificateStore::WebPki, 99, HeaderMap::new())
-				.unwrap();
+		let client = HttpTransportClient::new(
+			"http://localhost:9933",
+			80,
+			CertificateStore::WebPki,
+			99,
+			HeaderMap::new(),
+			Box::new([]),
+		)
+		.unwrap();
 		assert_eq!(client.max_request_body_size, eighty_bytes_limit);
 
 		let body = "a".repeat(81);
