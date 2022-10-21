@@ -24,11 +24,13 @@
 // IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::transport::HttpTransportClient;
 use crate::types::{ErrorResponse, Id, NotificationSer, RequestSer, Response};
+use crate::Middleware;
 use async_trait::async_trait;
 use hyper::http::HeaderMap;
 use jsonrpsee_core::client::{CertificateStore, ClientT, IdKind, RequestIdManager, Subscription, SubscriptionClientT};
@@ -64,7 +66,6 @@ use tracing::instrument;
 /// }
 ///
 /// ```
-#[derive(Debug)]
 pub struct HttpClientBuilder {
 	max_request_body_size: u32,
 	request_timeout: Duration,
@@ -73,6 +74,22 @@ pub struct HttpClientBuilder {
 	id_kind: IdKind,
 	max_log_length: u32,
 	headers: HeaderMap,
+	middleware_stack: Vec<Arc<dyn Middleware>>,
+}
+
+impl fmt::Debug for HttpClientBuilder {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		// skipping middleware_stack field for now
+		f.debug_struct("HttpClientBuilder")
+			.field("max_request_body_size", &self.max_request_body_size)
+			.field("request_timeout", &self.request_timeout)
+			.field("max_concurrent_requests", &self.max_concurrent_requests)
+			.field("certificate_store", &self.certificate_store)
+			.field("id_kind", &self.id_kind)
+			.field("max_log_length", &self.max_log_length)
+			.field("headers", &self.headers)
+			.finish_non_exhaustive()
+	}
 }
 
 impl HttpClientBuilder {
@@ -122,6 +139,26 @@ impl HttpClientBuilder {
 		self
 	}
 
+	/// Convenience method to attach middleware.
+	///
+	/// If you need to keep a reference to the middleware after attaching, use [`with_arc`].
+	///
+	/// [`with_arc`]: Self::with_arc
+	pub fn with<M>(self, middleware: M) -> Self
+	where
+		M: Middleware,
+	{
+		self.with_arc(Arc::new(middleware))
+	}
+
+	/// Add middleware to the chain. [`with`] is more ergonomic if you don't need the `Arc`.
+	///
+	/// [`with`]: Self::with
+	pub fn with_arc(mut self, middleware: Arc<dyn Middleware>) -> Self {
+		self.middleware_stack.push(middleware);
+		self
+	}
+
 	/// Build the HTTP client with target to connect to.
 	pub fn build(self, target: impl AsRef<str>) -> Result<HttpClient, Error> {
 		let transport = HttpTransportClient::new(
@@ -130,6 +167,7 @@ impl HttpClientBuilder {
 			self.certificate_store,
 			self.max_log_length,
 			self.headers,
+			self.middleware_stack.into_boxed_slice(),
 		)
 		.map_err(|e| Error::Transport(e.into()))?;
 		Ok(HttpClient {
@@ -150,6 +188,7 @@ impl Default for HttpClientBuilder {
 			id_kind: IdKind::Number,
 			max_log_length: 4096,
 			headers: HeaderMap::new(),
+			middleware_stack: Vec::new(),
 		}
 	}
 }

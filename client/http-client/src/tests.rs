@@ -26,7 +26,7 @@
 
 use crate::types::error::{ErrorCode, ErrorObject};
 
-use crate::HttpClientBuilder;
+use crate::{HeaderMap, HttpClientBuilder, Middleware};
 use jsonrpsee_core::client::{ClientT, IdKind};
 use jsonrpsee_core::params::BatchRequestBuilder;
 use jsonrpsee_core::rpc_params;
@@ -66,6 +66,28 @@ async fn method_call_with_id_str() {
 		.unwrap();
 	let uri = format!("http://{}", server_addr);
 	let client = HttpClientBuilder::default().id_format(IdKind::String).build(&uri).unwrap();
+	let response: String = client.request("o", rpc_params![]).with_default_timeout().await.unwrap().unwrap();
+	assert_eq!(&response, exp);
+}
+
+struct DummyMiddleware;
+
+#[async_trait::async_trait]
+impl Middleware for DummyMiddleware {
+	async fn handle(&self, _headers: &mut HeaderMap) {
+		println!("dummy middleware");
+	}
+}
+
+#[tokio::test]
+async fn method_call_with_middleware() {
+	let exp = "id as string";
+	let server_addr = http_server_with_hardcoded_response(ok_response(exp.into(), Id::Str("0".into())))
+		.with_default_timeout()
+		.await
+		.unwrap();
+	let uri = format!("http://{}", server_addr);
+	let client = HttpClientBuilder::default().id_format(IdKind::String).with(DummyMiddleware).build(&uri).unwrap();
 	let response: String = client.request("o", rpc_params![]).with_default_timeout().await.unwrap().unwrap();
 	assert_eq!(&response, exp);
 }
