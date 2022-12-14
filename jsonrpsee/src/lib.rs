@@ -36,10 +36,8 @@
 //! The following features are available.
 //!
 //! - **`http-client`** - JSON-RPC client functionality over HTTP protocol.
-//! - **`http-server`** - JSON-RPC server functionality over HTTP protocol.
 //! - **`wasm-client`** - JSON-RPC client functionality over web-sys.
 //! - **`ws-client`** - JSON-RPC client functionality over WebSocket protocol.
-//! - **`ws-server`** - JSON-RPC server functionality over WebSocket protocol.
 //! - **`macros`** - JSON-RPC API generation convenience by derive macros.
 //! - **`client-core`** - Enables minimal client features to generate the RPC API without transports.
 //! - **`client`** - Enables all client features including transports.
@@ -51,6 +49,7 @@
 //! - **`client-ws-transport-no-tls`** - Enables `ws` transport without TLS.
 //! - **`client-web-transport`** - Enables `websys` transport.
 
+#![warn(missing_docs, missing_debug_implementations, missing_copy_implementations, unreachable_pub)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 // Macros useful below, but not to be exposed outside of the crate.

@@ -36,7 +36,7 @@ use crate::future::{ConnectionGuard, FutureDriver, ServerHandle, StopHandle};
 use crate::logger::{Logger, TransportProtocol};
 use crate::transport::{http, ws};
 
-use futures_util::future::FutureExt;
+use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::io::{BufReader, BufWriter};
 
 use hyper::body::HttpBody;
@@ -55,6 +55,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tower::layer::util::Identity;
 use tower::{Layer, Service};
+use tracing::{instrument, Instrument};
 
 /// Default maximum connections allowed.
 const MAX_CONNECTIONS: u32 = 100;
@@ -138,53 +139,26 @@ where
 		loop {
 			match connections.select_with(&mut incoming).await {
 				Ok((socket, remote_addr)) => {
-					if let Err(e) = socket.set_nodelay(true) {
-						tracing::warn!("Could not set NODELAY on socket: {:?}", e);
-						continue;
-					}
-
-					let conn = match connection_guard.try_acquire() {
-						Some(conn) => conn,
-						None => {
-							tracing::warn!("Too many connections. Please try again later.");
-							connections.add(http::reject_connection(socket).boxed());
-							continue;
-						}
+					let data = ProcessConnection {
+						remote_addr,
+						methods: methods.clone(),
+						allow_hosts: allow_hosts.clone(),
+						resources: resources.clone(),
+						max_request_body_size,
+						max_response_body_size,
+						max_log_length,
+						batch_requests_supported,
+						id_provider: id_provider.clone(),
+						ping_interval: self.cfg.ping_interval,
+						stop_handle: stop_handle.clone(),
+						max_subscriptions_per_connection,
+						conn_id: id,
+						logger: logger.clone(),
+						max_connections: self.cfg.max_connections,
+						enable_http: self.cfg.enable_http,
+						enable_ws: self.cfg.enable_ws,
 					};
-
-					let tower_service = TowerService {
-						inner: ServiceData {
-							remote_addr,
-							methods: methods.clone(),
-							allow_hosts: allow_hosts.clone(),
-							resources: resources.clone(),
-							max_request_body_size,
-							max_response_body_size,
-							max_log_length,
-							batch_requests_supported,
-							id_provider: id_provider.clone(),
-							ping_interval: self.cfg.ping_interval,
-							stop_handle: stop_handle.clone(),
-							max_subscriptions_per_connection,
-							conn_id: id,
-							logger: logger.clone(),
-							conn: Arc::new(conn),
-						},
-					};
-
-					let service = self.service_builder.service(tower_service);
-
-					let max_conns = self.cfg.max_connections as usize;
-					let curr_conns = max_conns - connection_guard.available_connections();
-
-					connections.add(Box::pin(try_accept_connection(
-						socket,
-						service,
-						stop_handle.clone(),
-						curr_conns,
-						max_conns,
-					)));
-
+					process_connection(&self.service_builder, &connection_guard, data, socket, &mut connections);
 					id = id.wrapping_add(1);
 				}
 				Err(MonitoredError::Selector(err)) => {
@@ -221,6 +195,10 @@ struct Settings {
 	tokio_runtime: Option<tokio::runtime::Handle>,
 	/// The interval at which `Ping` frames are submitted.
 	ping_interval: Duration,
+	/// Enable HTTP.
+	enable_http: bool,
+	/// Enable WS.
+	enable_ws: bool,
 }
 
 impl Default for Settings {
@@ -235,6 +213,8 @@ impl Default for Settings {
 			allow_hosts: AllowHosts::Any,
 			tokio_runtime: None,
 			ping_interval: Duration::from_secs(60),
+			enable_http: true,
+			enable_ws: true,
 		}
 	}
 }
@@ -453,6 +433,26 @@ impl<B, L> Builder<B, L> {
 		}
 	}
 
+	/// Configure the server to only serve JSON-RPC HTTP requests.
+	///
+	/// Default: both http and ws are enabled.
+	pub fn http_only(mut self) -> Self {
+		self.settings.enable_http = true;
+		self.settings.enable_ws = false;
+		self
+	}
+
+	/// Configure the server to only serve JSON-RPC WebSocket requests.
+	///
+	/// That implies that server just denies HTTP requests which isn't a WebSocket upgrade request
+	///
+	/// Default: both http and ws are enabled.
+	pub fn ws_only(mut self) -> Self {
+		self.settings.enable_http = false;
+		self.settings.enable_ws = true;
+		self
+	}
+
 	/// Finalize the configuration of the server. Consumes the [`Builder`].
 	///
 	/// ```rust
@@ -531,6 +531,13 @@ impl MethodResult {
 			Self::SendAndLogger(r) => r,
 		}
 	}
+
+	pub(crate) fn into_inner(self) -> MethodResponse {
+		match self {
+			Self::JustLogger(r) => r,
+			Self::SendAndLogger(r) => r,
+		}
+	}
 }
 
 /// Data required by the server to handle requests.
@@ -568,13 +575,17 @@ pub(crate) struct ServiceData<L: Logger> {
 	pub(crate) logger: L,
 	/// Handle to hold a `connection permit`.
 	pub(crate) conn: Arc<OwnedSemaphorePermit>,
+	/// Enable HTTP.
+	pub(crate) enable_http: bool,
+	/// Enable WS.
+	pub(crate) enable_ws: bool,
 }
 
 /// JsonRPSee service compatible with `tower`.
 ///
 /// # Note
 /// This is similar to [`hyper::service::service_fn`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TowerService<L: Logger> {
 	inner: ServiceData<L>,
 }
@@ -610,7 +621,9 @@ impl<L: Logger> hyper::service::Service<hyper::Request<hyper::Body>> for TowerSe
 			return async { Ok(http::response::host_not_allowed()) }.boxed();
 		}
 
-		if is_upgrade_request(&request) {
+		let is_upgrade_request = is_upgrade_request(&request);
+
+		if self.inner.enable_ws && is_upgrade_request {
 			let mut server = soketto::handshake::http::Server::new();
 
 			let response = match server.receive_request(&request) {
@@ -618,22 +631,25 @@ impl<L: Logger> hyper::service::Service<hyper::Request<hyper::Body>> for TowerSe
 					self.inner.logger.on_connect(self.inner.remote_addr, &request, TransportProtocol::WebSocket);
 					let data = self.inner.clone();
 
-					tokio::spawn(async move {
-						let upgraded = match hyper::upgrade::on(request).await {
-							Ok(u) => u,
-							Err(e) => {
-								tracing::warn!("Could not upgrade connection: {}", e);
-								return;
-							}
-						};
+					tokio::spawn(
+						async move {
+							let upgraded = match hyper::upgrade::on(request).await {
+								Ok(u) => u,
+								Err(e) => {
+									tracing::warn!("Could not upgrade connection: {}", e);
+									return;
+								}
+							};
 
-						let stream = BufReader::new(BufWriter::new(upgraded.compat()));
-						let mut ws_builder = server.into_builder(stream);
-						ws_builder.set_max_message_size(data.max_request_body_size as usize);
-						let (sender, receiver) = ws_builder.finish();
+							let stream = BufReader::new(BufWriter::new(upgraded.compat()));
+							let mut ws_builder = server.into_builder(stream);
+							ws_builder.set_max_message_size(data.max_request_body_size as usize);
+							let (sender, receiver) = ws_builder.finish();
 
-						let _ = ws::background_task::<L>(sender, receiver, data).await;
-					});
+							let _ = ws::background_task::<L>(sender, receiver, data).await;
+						}
+						.in_current_span(),
+					);
 
 					response.map(|()| hyper::Body::empty())
 				}
@@ -644,7 +660,7 @@ impl<L: Logger> hyper::service::Service<hyper::Request<hyper::Body>> for TowerSe
 			};
 
 			async { Ok(response) }.boxed()
-		} else {
+		} else if self.inner.enable_http && !is_upgrade_request {
 			// The request wasn't an upgrade request; let's treat it as a standard HTTP request:
 			let data = http::HandleRequest {
 				methods: self.inner.methods.clone(),
@@ -661,6 +677,8 @@ impl<L: Logger> hyper::service::Service<hyper::Request<hyper::Body>> for TowerSe
 			self.inner.logger.on_connect(self.inner.remote_addr, &request, TransportProtocol::Http);
 
 			Box::pin(http::handle_request(request, data).map(Ok))
+		} else {
+			Box::pin(async { http::response::denied() }.map(Ok))
 		}
 	}
 }
@@ -715,14 +733,113 @@ where
 	}
 }
 
-// Attempts to accept a new connection
-async fn try_accept_connection<S, Bd>(
+struct ProcessConnection<L> {
+	/// Remote server address.
+	remote_addr: SocketAddr,
+	/// Registered server methods.
+	methods: Methods,
+	/// Access control.
+	allow_hosts: AllowHosts,
+	/// Tracker for currently used resources on the server.
+	resources: Resources,
+	/// Max request body size.
+	max_request_body_size: u32,
+	/// Max response body size.
+	max_response_body_size: u32,
+	/// Max length for logging for request and response
+	///
+	/// Logs bigger than this limit will be truncated.
+	max_log_length: u32,
+	/// Whether batch requests are supported by this server or not.
+	batch_requests_supported: bool,
+	/// Subscription ID provider.
+	id_provider: Arc<dyn IdProvider>,
+	/// Ping interval
+	ping_interval: Duration,
+	/// Stop handle.
+	stop_handle: StopHandle,
+	/// Max subscriptions per connection.
+	max_subscriptions_per_connection: u32,
+	/// Max connections,
+	max_connections: u32,
+	/// Connection ID
+	conn_id: u32,
+	/// Logger.
+	logger: L,
+	/// Allow JSON-RPC HTTP requests.
+	enable_http: bool,
+	/// Allow JSON-RPC WS request and WS upgrade requests.
+	enable_ws: bool,
+}
+
+#[instrument(name = "connection", skip_all, fields(remote_addr = %cfg.remote_addr, conn_id = %cfg.conn_id), level = "INFO")]
+fn process_connection<'a, L: Logger, B, U>(
+	service_builder: &tower::ServiceBuilder<B>,
+	connection_guard: &ConnectionGuard,
+	cfg: ProcessConnection<L>,
 	socket: TcpStream,
-	service: S,
-	mut stop_handle: StopHandle,
-	curr_conns: usize,
-	max_conns: usize,
+	connections: &mut FutureDriver<BoxFuture<'a, ()>>,
 ) where
+	B: Layer<TowerService<L>> + Send + 'static,
+	<B as Layer<TowerService<L>>>::Service: Send
+		+ Service<
+			hyper::Request<hyper::Body>,
+			Response = hyper::Response<U>,
+			Error = Box<(dyn StdError + Send + Sync + 'static)>,
+		>,
+	<<B as Layer<TowerService<L>>>::Service as Service<hyper::Request<hyper::Body>>>::Future: Send,
+	U: HttpBody + Send + 'static,
+	<U as HttpBody>::Error: Send + Sync + StdError,
+	<U as HttpBody>::Data: Send,
+{
+	if let Err(e) = socket.set_nodelay(true) {
+		tracing::warn!("Could not set NODELAY on socket: {:?}", e);
+		return;
+	}
+
+	let conn = match connection_guard.try_acquire() {
+		Some(conn) => conn,
+		None => {
+			tracing::warn!("Too many connections. Please try again later.");
+			connections.add(http::reject_connection(socket).in_current_span().boxed());
+			return;
+		}
+	};
+
+	let max_conns = cfg.max_connections as usize;
+	let curr_conns = max_conns - connection_guard.available_connections();
+	tracing::info!("Accepting new connection {}/{}", curr_conns, max_conns);
+
+	let tower_service = TowerService {
+		inner: ServiceData {
+			remote_addr: cfg.remote_addr,
+			methods: cfg.methods,
+			allow_hosts: cfg.allow_hosts,
+			resources: cfg.resources,
+			max_request_body_size: cfg.max_request_body_size,
+			max_response_body_size: cfg.max_response_body_size,
+			max_log_length: cfg.max_log_length,
+			batch_requests_supported: cfg.batch_requests_supported,
+			id_provider: cfg.id_provider,
+			ping_interval: cfg.ping_interval,
+			stop_handle: cfg.stop_handle.clone(),
+			max_subscriptions_per_connection: cfg.max_subscriptions_per_connection,
+			conn_id: cfg.conn_id,
+			logger: cfg.logger,
+			conn: Arc::new(conn),
+			enable_http: cfg.enable_http,
+			enable_ws: cfg.enable_ws,
+		},
+	};
+
+	let service = service_builder.service(tower_service);
+
+	connections.add(Box::pin(try_accept_connection(socket, service, cfg.stop_handle).in_current_span()));
+}
+
+// Attempts to create a HTTP connection from a socket.
+async fn try_accept_connection<S, Bd>(socket: TcpStream, service: S, mut stop_handle: StopHandle)
+where
 	S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<Bd>> + Send + 'static,
 	S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 	S::Future: Send,
@@ -736,9 +853,8 @@ async fn try_accept_connection<S, Bd>(
 
 	tokio::select! {
 		res = &mut conn => {
-			match res {
-				Ok(_) => tracing::info!("Accepting new connection {}/{}", curr_conns, max_conns),
-				Err(e) => tracing::warn!("Connection failed: {:?}", e),
+			if let Err(e) = res {
+				tracing::warn!("HTTP serve connection failed {:?}", e);
 			}
 		}
 		_ = stop_handle.shutdown() => {

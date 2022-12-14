@@ -1,6 +1,6 @@
 [package]
 name = "jsonrpsee-benchmarks"
-version = "0.15.1"
+version = "0.16.2"
 authors = ["Parity Technologies <admin@parity.io>"]
 description = "Benchmarks for jsonrpsee"
 edition = "2021"
@@ -8,8 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-pprof = { version = "0.10", features = ["flamegraph", "criterion"] }
-criterion = { version = "0.3", features = ["async_tokio", "html_reports"] }
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+criterion = { version = "0.4", features = ["async_tokio", "html_reports"] }
 futures-channel = "0.3.15"
 futures-util = "0.3.15"
 jsonrpsee = { path = "../jsonrpsee", features = ["server"] }

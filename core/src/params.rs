@@ -46,7 +46,7 @@ mod params_builder {
 	///   1. Other serialization methods than `serde_json::to_writer` would internally
 	///      have an extra heap allocation for temporarily holding the value in memory.
 	///   2. `io::Write` is not implemented for `String` required for serialization.
-	#[derive(Debug)]
+	#[derive(Debug, Clone)]
 	pub(crate) struct ParamsBuilder {
 		bytes: Vec<u8>,
 		start: char,
@@ -141,7 +141,7 @@ mod params_builder {
 ///
 /// // Use RPC parameters...
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectParams(params_builder::ParamsBuilder);
 
 impl ObjectParams {
@@ -188,7 +188,7 @@ impl ToRpcParams for ObjectParams {
 ///
 /// // Use RPC parameters...
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArrayParams(params_builder::ParamsBuilder);
 
 impl ArrayParams {
@@ -240,7 +240,26 @@ impl<'a> BatchRequestBuilder<'a> {
 	}
 
 	/// Finish the building process and return a valid batch parameter.
-	pub fn build(self) -> Vec<(&'a str, Option<Box<RawValue>>)> {
-		self.0
+	#[allow(clippy::type_complexity)]
+	pub fn build(self) -> Result<Vec<(&'a str, Option<Box<RawValue>>)>, Error> {
+		if self.0.is_empty() {
+			Err(Error::EmptyBatchRequest)
+		} else {
+			Ok(self.0)
+		}
+	}
+
+	/// Get an iterator over the batch request.
+	pub fn iter(&self) -> impl Iterator<Item = (&'a str, Option<&RawValue>)> {
+		self.0.iter().map(|(method, params)| (*method, params.as_deref()))
+	}
+}
+
+impl<'a> IntoIterator for BatchRequestBuilder<'a> {
+	type Item = (&'a str, Option<Box<RawValue>>);
+	type IntoIter = std::vec::IntoIter<Self::Item>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.into_iter()
 	}
 }

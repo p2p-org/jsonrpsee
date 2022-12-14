@@ -17,7 +17,7 @@ error[E0277]: the trait bound `for<'de> <Conf as Config>::Hash: Deserialize<'de>
 10 | #[rpc(server, client, namespace = "foo", client_bounds(), server_bounds())]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `<Conf as Config>::Hash`
    |
-   = note: required because of the requirements on the impl of `DeserializeOwned` for `<Conf as Config>::Hash`
+   = note: required for `<Conf as Config>::Hash` to implement `DeserializeOwned`
 note: required by a bound in `request`
   --> $WORKSPACE/core/src/client/mod.rs
    |

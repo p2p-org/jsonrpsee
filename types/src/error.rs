@@ -79,7 +79,6 @@ impl<'a> fmt::Display for ErrorResponse<'a> {
 		write!(f, "{}", serde_json::to_string(&self).expect("infallible; qed"))
 	}
 }
-
 /// The return type of the subscription's method for the rpc server implementation.
 ///
 /// **Note**: The error does not contain any data and is discarded on drop.
@@ -89,7 +88,7 @@ pub type SubscriptionResult = Result<(), SubscriptionEmptyError>;
 ///
 /// It contains no data, and neither is the error utilized. It provides an abstraction to make the
 /// API more ergonomic while handling errors that may occur during the subscription callback.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SubscriptionEmptyError;
 
 impl From<anyhow::Error> for SubscriptionEmptyError {
@@ -117,7 +116,7 @@ impl From<SubscriptionAcceptRejectError> for SubscriptionEmptyError {
 }
 
 /// The error returned while accepting or rejecting a subscription.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum SubscriptionAcceptRejectError {
 	/// The method was already called.
 	AlreadyCalled,

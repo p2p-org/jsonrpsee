@@ -157,7 +157,7 @@ impl<'a> Params<'a> {
 /// params parsing (often) yields values of different types.
 ///
 /// Regards empty array `[]` as no parameters provided.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct ParamsSequence<'a>(&'a str);
 
 impl<'a> ParamsSequence<'a> {
@@ -369,6 +369,15 @@ impl<'a> Id<'a> {
 			Id::Null => Id::Null,
 			Id::Number(num) => Id::Number(num),
 			Id::Str(s) => Id::Str(Cow::owned(s.into_owned())),
+		}
+	}
+
+	/// Extract the underlying number from the ID.
+	pub fn try_parse_inner_as_number(&self) -> Option<u64> {
+		match self {
+			Id::Null => None,
+			Id::Number(num) => Some(*num),
+			Id::Str(s) => s.parse().ok(),
 		}
 	}
 }
