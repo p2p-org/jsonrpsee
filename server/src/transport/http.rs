@@ -6,7 +6,7 @@ use crate::logger::{self, Logger, TransportProtocol};
 
 use futures_util::future::Either;
 use futures_util::stream::{FuturesOrdered, StreamExt};
-use http::Method;
+use hyper::Method;
 use jsonrpsee_core::error::GenericTransportError;
 use jsonrpsee_core::http_helpers::read_body;
 use jsonrpsee_core::server::helpers::{prepare_error, BatchResponse, BatchResponseBuilder, MethodResponse};
@@ -23,7 +23,7 @@ type Notif<'a> = Notification<'a, Option<&'a JsonRawValue>>;
 
 /// Checks that content type of received request is valid for JSON-RPC.
 pub(crate) fn content_type_is_json(request: &hyper::Request<hyper::Body>) -> bool {
-	is_json(request.headers().get(http::header::CONTENT_TYPE))
+	is_json(request.headers().get(hyper::header::CONTENT_TYPE))
 }
 
 /// Returns true if the `content_type` header indicates a valid JSON message.
@@ -344,8 +344,7 @@ pub(crate) async fn handle_request<L: Logger>(
 }
 
 pub(crate) mod response {
-	use jsonrpsee_types::error::reject_too_big_request;
-	use jsonrpsee_types::error::{ErrorCode, ErrorResponse};
+	use jsonrpsee_types::error::{reject_too_big_request, ErrorCode, ErrorResponse};
 	use jsonrpsee_types::Id;
 
 	const JSON: &str = "application/json; charset=utf-8";
